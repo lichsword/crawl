@@ -1,4 +1,5 @@
 import crypt
+import functools
 import hashlib
 import logging
 import os.path
@@ -17,6 +18,25 @@ from util import send_email
 from util import validate_email_address
 
 
+def with_database(database):
+    # TODO: based on userdb; why doesn't this just keep the database open?
+    # I think sqlite can handle that...
+    def wrapper(func):
+        @functools.wraps(func)
+        def inner(*args, **kwargs):
+            try:
+                conn = sqlite3.connect(database)
+                c = conn.cursor()
+                return func(conn, c, *args, **kwargs)
+            finally:
+                if c:
+                    c.close()
+                if conn:
+                    conn.close()
+        return inner
+    return wrapper
+
+
 def setup_settings_path():
     global settings_db
     try:
@@ -33,155 +53,93 @@ def ensure_settings_db_exists():
     if os.path.exists(settings_db):
         return
     logging.warn("User settings database didn't exist at '%s'; creating it now." % settings_db)
-    c = None
-    conn = None
-    try:
-        conn = sqlite3.connect(settings_db)
-        c = conn.cursor()
-        schema = ("CREATE TABLE mutesettings (username text primary key not null unique, mutelist text default '');")
-        c.execute(schema)
-        conn.commit()
-    finally:
-        if c:
-            c.close()
-        if conn:
-            conn.close()
+    create_settings_db()
 
 
-def get_mutelist(username):
-    # TODO: based on userdb; why doesn't this just keep the database open?
-    # I think sqlite can handle that...
-    try:
-        conn = sqlite3.connect(settings_db)
-        c = conn.cursor()
-        c.execute("select mutelist from mutesettings where username=? collate nocase",
-                  (username,))
-        result = c.fetchone()
-
-        if result is None:
-            return None
-        else:
-            return result[0]
-    finally:
-        if c:
-            c.close()
-        if conn:
-            conn.close()
+@with_database(settings_db)
+def create_settings_db(conn, c):
+    schema = ("CREATE TABLE mutesettings (username text primary key not null unique, mutelist text default '');")
+    c.execute(schema)
+    conn.commit()
 
 
-def set_mutelist(username, mutelist):
-    # TODO: based on userdb; why doesn't this just keep the database open?
-    # I think sqlite can handle that...
-    try:
-        conn = sqlite3.connect(settings_db)
-        c = conn.cursor()
-        if mutelist is None:
-            mutelist = ""
-
-        # n.b. the following will wipe out any columns not mentioned, if there
-        # ever are any...
-        c.execute("insert or replace into mutesettings(username, mutelist) values (?,?)",
-                  (username, mutelist))
-
-        conn.commit()
-    finally:
-        if c:
-            c.close()
-        if conn:
-            conn.close()
+@with_database(settings_db)
+def get_mutelist(conn, c, username):
+    c.execute("select mutelist from mutesettings where username=? collate nocase",
+              (username,))
+    result = c.fetchone()
+    return result[0] if result is not None else None
 
 
-def get_user_info(username):
+@with_database(settings_db)
+def set_mutelist(conn, c, username, mutelist):
+    if mutelist is None:
+        mutelist = ""
+
+    # n.b. the following will wipe out any columns not mentioned, if there
+    # ever are any...
+    c.execute("insert or replace into mutesettings(username, mutelist) values (?,?)",
+              (username, mutelist))
+
+    conn.commit()
+
+
+@with_database(password_db)
+def get_user_info(conn, c, username):
     """Returns user data in a tuple (userid, email)."""
-    try:
-        conn = sqlite3.connect(password_db)
-        c = conn.cursor()
-        c.execute("select id,email from dglusers where username=? collate nocase",
-                  (username,))
-        result = c.fetchone()
-
-        if result is None:
-            return None
-        else:
-            return result[0], result[1]
-    finally:
-        if c:
-            c.close()
-        if conn:
-            conn.close()
+    c.execute("select id,email from dglusers where username=? collate nocase",
+              (username,))
+    result = c.fetchone()
+    return (result[0], result[1]) if result is not None else None
 
 
-def user_passwd_match(username, passwd):
+@with_database(password_db)
+def user_passwd_match(conn, c, username, passwd):
     """Returns the correctly cased username."""
-    try:
-        passwd = passwd[0:max_passwd_length]
-    except:
+    passwd = passwd[0:max_passwd_length]
+
+    c.execute("select username,password from dglusers where username=? collate nocase",
+              (username,))
+    result = c.fetchone()
+
+    if result is None:
         return None
-
-    try:
-        conn = sqlite3.connect(password_db)
-        c = conn.cursor()
-        c.execute("select username,password from dglusers where username=? collate nocase",
-                  (username,))
-        result = c.fetchone()
-
-        if result is None:
-            return None
-        elif crypt.crypt(passwd, result[1]) == result[1]:
-            return result[0]
-    finally:
-        if c:
-            c.close()
-        if conn:
-            conn.close()
+    elif crypt.crypt(passwd, result[1]) == result[1]:
+        return result[0]
 
 
 def ensure_user_db_exists():
     if os.path.exists(password_db):
         return
     logging.warn("User database didn't exist; creating it now.")
-    c = None
-    conn = None
-    try:
-        conn = sqlite3.connect(password_db)
-        c = conn.cursor()
-        schema = ("CREATE TABLE dglusers (id integer primary key," +
-                  " username text, email text, env text," +
-                  " password text, flags integer);")
-        c.execute(schema)
+    create_user_db()
+
+
+@with_database(password_db)
+def create_user_db(conn, c):
+    schema = ("CREATE TABLE dglusers (id integer primary key," +
+              " username text, email text, env text," +
+              " password text, flags integer);")
+    c.execute(schema)
+    schema = ("CREATE TABLE recovery_tokens (token text primary key,"
+              " token_time text, user_id integer not null,"
+              " foreign key(user_id) references dglusers(id));")
+    c.execute(schema)
+    conn.commit()
+
+
+@with_database(password_db)
+def upgrade_user_db(conn, c):
+    """Automatically upgrades the database."""
+    tables = [i[0] for i in c.execute("SELECT name FROM sqlite_master WHERE type='table';")]
+
+    if "recovery_tokens" not in tables:
+        logging.warn("User database missing table 'recovery_tokens'; adding now")
         schema = ("CREATE TABLE recovery_tokens (token text primary key,"
                   " token_time text, user_id integer not null,"
                   " foreign key(user_id) references dglusers(id));")
         c.execute(schema)
         conn.commit()
-    finally:
-        if c:
-            c.close()
-        if conn:
-            conn.close()
-
-
-# automatically upgrades database
-def upgrade_user_db():
-    c = None
-    conn = None
-    try:
-        conn = sqlite3.connect(password_db)
-        c = conn.cursor()
-        tables = [i[0] for i in c.execute("SELECT name FROM sqlite_master WHERE type='table';")]
-
-        if "recovery_tokens" not in tables:
-            logging.warn("User database missing table 'recovery_tokens'; adding now")
-            schema = ("CREATE TABLE recovery_tokens (token text primary key,"
-                      " token_time text, user_id integer not null,"
-                      " foreign key(user_id) references dglusers(id));")
-            c.execute(schema)
-            conn.commit()
-    finally:
-        if c:
-            c.close()
-        if conn:
-            conn.close()
 
 
 _SALTCHARS = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -202,7 +160,8 @@ def encrypt_pw(passwd):
     return crypt.crypt(passwd, salt)
 
 
-def register_user(username, passwd, email):  # Returns an error message or None
+@with_database(password_db)
+def register_user(conn, c, username, passwd, email):  # Returns an error message or None
     if passwd == "":
         return "The password can't be empty!"
     if email:  # validate the email only if it is provided
@@ -215,86 +174,68 @@ def register_user(username, passwd, email):  # Returns an error message or None
 
     crypted_pw = encrypt_pw(passwd)
 
-    try:
-        conn = sqlite3.connect(password_db)
-        c = conn.cursor()
-        c.execute("select username from dglusers where username=? collate nocase",
-                  (username,))
-        result = c.fetchone()
+    c.execute("select username from dglusers where username=? collate nocase",
+              (username,))
+    result = c.fetchone()
 
-        if result:
-            return "User already exists!"
+    if result:
+        return "User already exists!"
 
-        c.execute("insert into dglusers(username, email, password, flags, env) values (?,?,?,0,'')",
-                  (username, email, crypted_pw))
+    c.execute("insert into dglusers(username, email, password, flags, env) values (?,?,?,0,'')",
+              (username, email, crypted_pw))
 
-        conn.commit()
+    conn.commit()
 
-        return None
-    finally:
-        if c:
-            c.close()
-        if conn:
-            conn.close()
+    return None
 
 
-def change_email(user_id, email):  # Returns an error message or None
+@with_database(password_db)
+def change_email(conn, c, user_id, email):  # Returns an error message or None
     result = validate_email_address(email)
     if result:
         return result
 
-    try:
-        conn = sqlite3.connect(password_db)
-        c = conn.cursor()
-        c.execute("update dglusers set email=? where id=?",
-                  (email, user_id))
+    c.execute("update dglusers set email=? where id=?", (email, user_id))
+    conn.commit()
 
-        conn.commit()
-
-        return None
-    finally:
-        if c:
-            c.close()
-        if conn:
-            conn.close()
+    return None
 
 
-def find_recovery_token(token):
+@with_database(password_db)
+def find_recovery_token(conn, c, token):
     # Returns tuple (userid, username, error)
     token_hash_obj = hashlib.sha256(token)
     token_hash = token_hash_obj.hexdigest()
 
-    try:
-        conn = sqlite3.connect(password_db)
-        c = conn.cursor()
-        c.execute("""\
+    c.execute("""\
 select u.id, u.username, case when t.token_time > datetime('now','-1 hour') then 'N' else 'Y' end as Expired
 from recovery_tokens t
 join dglusers u on u.id = t.user_id
 where t.token = ?
 collate rtrim
 """, (token_hash,))
-        result = c.fetchone()
+    result = c.fetchone()
 
-        if not result:
-            return None, None, "Invalid token"
+    if not result:
+        return None, None, "Invalid token"
+    else:
+        userid = result[0]
+        username = result[1]
+        expired = result[2]
+        if expired == 'Y':
+            return userid, username, "Expired token"
         else:
-            userid = result[0]
-            username = result[1]
-            expired = result[2]
-            if expired == 'Y':
-                return userid, username, "Expired token"
-            else:
-                return userid, username, None
-    finally:
-        if c:
-            c.close()
-        if conn:
-            conn.close()
+            return userid, username, None
 
 
-def update_user_password_from_token(token, passwd):
-    # Returns a tuple where item 1 is the username that was found for the given token, and item 2 is an error message or None
+@with_database(password_db)
+def update_user_password_from_token(conn, c, token, passwd):
+    """
+    Returns:
+      (None, error string)
+      (username, error string)
+      (username, None)
+    """
     if passwd == "":
         return None, "The password can't be empty!"
     crypted_pw = encrypt_pw(passwd)
@@ -302,56 +243,48 @@ def update_user_password_from_token(token, passwd):
     userid, username, token_error = find_recovery_token(token)
 
     if userid and not token_error:
-        try:
-            conn = sqlite3.connect(password_db)
-            c = conn.cursor()
-            c.execute("update dglusers set password=? where id=?",
-                      (crypted_pw, userid))
-            c.execute("delete from recovery_tokens where user_id=?",
-                      (userid,))
-            conn.commit()
-        finally:
-            if c:
-                c.close()
-            if conn:
-                conn.close()
+        c.execute("update dglusers set password=? where id=?",
+                  (crypted_pw, userid))
+        c.execute("delete from recovery_tokens where user_id=?",
+                  (userid,))
+        conn.commit()
 
     return username, token_error
 
 
-def send_forgot_password(email):  # Returns a tuple where item 1 is a truthy value when an email was sent, and item 2 is an error message or None
+@with_database(password_db)
+def send_forgot_password(conn, c, email):
+    """
+    Returns:
+        (email_sent: bool, error: string)
+    """
     if not email:
         return False, "Email address can't be empty"
     email_error = validate_email_address(email)
     if email_error:
         return False, email_error
 
-    try:
-        # lookup user-provided email
-        conn = sqlite3.connect(password_db)
-        c = conn.cursor()
-        c.execute("select id from dglusers where email=? collate nocase",
-                  (email,))
-        result = c.fetchone()
+    c.execute("select id from dglusers where email=? collate nocase", (email,))
+    result = c.fetchone()
+    if not result:
+        return False, None
 
-        # user was found
-        if result:
-            userid = result[0]
-            # generate random token
-            token_bytes = os.urandom(32)
-            token = urlsafe_b64encode(token_bytes)
-            # hash token
-            token_hash_obj = hashlib.sha256(token)
-            token_hash = token_hash_obj.hexdigest()
-            # store hash in db
-            c.execute("insert into recovery_tokens(token, token_time, user_id) "
-                      "values (?,datetime('now'),?)", (token_hash, userid))
-            conn.commit()
+    userid = result[0]
+    # generate random token
+    token_bytes = os.urandom(32)
+    token = urlsafe_b64encode(token_bytes)
+    # hash token
+    token_hash_obj = hashlib.sha256(token)
+    token_hash = token_hash_obj.hexdigest()
+    # store hash in db
+    c.execute("insert into recovery_tokens(token, token_time, user_id) "
+              "values (?,datetime('now'),?)", (token_hash, userid))
+    conn.commit()
 
-            # send email
-            url_text = config.lobby_url + "?ResetToken=" + token
+    # send email
+    url_text = config.lobby_url + "?ResetToken=" + token
 
-            msg_body_plaintext = """Someone (hopefully you) has requested to reset the password for your account at """ + config.lobby_url + """.
+    msg_body_plaintext = """Someone (hopefully you) has requested to reset the password for your account at """ + config.lobby_url + """.
 
 If you initiated this request, please use this link to reset your password:
 
@@ -360,7 +293,7 @@ If you initiated this request, please use this link to reset your password:
 If you did not ask to reset your password, feel free to ignore this email.
 """
 
-            msg_body_html = """<html>
+    msg_body_html = """<html>
   <head></head>
   <body>
     <p>Someone (hopefully you) has requested to reset the password for your account at """ + config.lobby_url + """.<br /><br />
@@ -371,15 +304,7 @@ If you did not ask to reset your password, feel free to ignore this email.
   </body>
 </html>"""
 
-            send_email(email, 'Request to reset your password',
-                       msg_body_plaintext, msg_body_html)
+    send_email(email, 'Request to reset your password',
+               msg_body_plaintext, msg_body_html)
 
-            return True, None
-
-        # email was not found, do nothing
-        return False, None
-    finally:
-        if c:
-            c.close()
-        if conn:
-            conn.close()
+    return True, None
