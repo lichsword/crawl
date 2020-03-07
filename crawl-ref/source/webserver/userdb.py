@@ -18,6 +18,16 @@ from util import send_email
 from util import validate_email_address
 
 
+class User(object):
+    """Represents an account."""
+
+    def __init__(self):
+        self.id = None
+        self.username = None
+        self.email = None
+        self.is_admin = False
+
+
 def with_database(database):
     # TODO: based on userdb; why doesn't this just keep the database open?
     # I think sqlite can handle that...
@@ -87,10 +97,16 @@ def set_mutelist(conn, c, username, mutelist):
 @with_database(password_db)
 def get_user_info(conn, c, username):
     """Returns user data in a tuple (userid, email)."""
-    c.execute("select id,email from dglusers where username=? collate nocase",
+    c.execute("select id,email,flags from dglusers where username=? collate nocase",
               (username,))
     result = c.fetchone()
-    return (result[0], result[1]) if result is not None else None
+    if result:
+        user = User()
+        user.id = result[0]
+        user.username = username
+        user.email = result[1]
+        user.is_admin = bool(result[2])
+        return user
 
 
 @with_database(password_db)
