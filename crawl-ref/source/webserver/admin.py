@@ -1,3 +1,7 @@
+import os
+
+import tornado.iostream
+import tornado.template
 import tornado.web
 
 import config
@@ -30,6 +34,17 @@ class AdminOnlyMixin(AuthRequiredMixin):
         return user
 
 
+class DownloadHandler(AdminOnlyMixin, tornado.web.StaticFileHandler):
+
+    def initialize(self):
+        self.root = "."
+        super(DownloadHandler, self).initialize()
+
+    def get(self, path=None, include_body=True):
+        self.set_header("Content-Type", "application/octet-stream")
+        super(DownloadHandler, self).get(path, include_body)
+
+
 class AdminHandler(AdminOnlyMixin, tornado.web.RequestHandler):
     """Handler for main admin panel."""
 
@@ -49,3 +64,35 @@ class AdminHandler(AdminOnlyMixin, tornado.web.RequestHandler):
             for game_id in dedup_games.values()
         }
 
+
+class ViewUserHandler(AdminOnlyMixin, tornado.web.RequestHandler):
+    """Handler for user view."""
+
+    def get(self, username):
+        user = userdb.get_user_info(username)
+        if not user:
+            raise tornado.web.HTTPError(404)
+
+        user_saves = self._get_saves_for_user(user.username)
+        self.render("user.html",
+                    config=config,
+                    user=user,
+                    user_saves=user_saves)
+
+    def _get_save_dirs(self):
+        try:
+            crawl_base_dir = os.path.join(config.chroot, 'crawl-master')
+            return [
+                (subdir, os.path.join(crawl_base_dir, subdir, 'saves'))
+                for subdir in os.listdir(crawl_base_dir)
+                if os.path.isdir(subdir)
+            ]
+        except AttributeError:
+            return [('trunk', 'saves')]
+
+    def _get_saves_for_user(self, username):
+        saves = [
+            (name, os.path.join(d, username+'.cs'))
+            for name, d in self._get_save_dirs()
+        ]
+        return [(name, save) for name, save in saves if os.path.isfile(save)]

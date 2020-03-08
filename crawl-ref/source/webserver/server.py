@@ -132,6 +132,8 @@ def bind_server():
     application = tornado.web.Application([
             (r"/", MainHandler),
             (r"/admin/", admin.AdminHandler),
+            (r"/admin/dl/(.*)", admin.DownloadHandler, {}, "admin_download"),
+            (r"/user/(.*)/", admin.ViewUserHandler),
             (r"/socket", CrawlWebSocket),
             (r"/gamedata/(.*)/(.*)", GameDataHandler)
             ], gzip=getattr(config,"use_gzip",True), **settings)
